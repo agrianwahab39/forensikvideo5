@@ -3139,8 +3139,7 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
         'plots': {},          # akan diisi dengan bytes
         'include_simple': include_simple,
         'include_technical': include_technical,
-        'metadata': result.metadata,
-        'metadata_analysis': result.metadata_analysis
+
     }
 
     # Konversi gambar lokal dan plot menjadi bytes untuk penyematan
