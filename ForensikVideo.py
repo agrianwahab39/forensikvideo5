@@ -200,6 +200,8 @@ class AnalysisResult:
     localizations: list[dict] = field(default_factory=list)
     zip_report_path: Optional[Path] = None
     pdf_report_path: Optional[Path] = None
+    zip_report_bytes: Optional[bytes] = None
+    pdf_report_bytes: Optional[bytes] = None
 
     # Tambahan untuk Tahap 3
     detailed_anomaly_analysis: dict = field(default_factory=dict)
@@ -3300,16 +3302,15 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
         }}
     ''')
 
-    # 6. Simpan hasil ke buffer
+    # 6. Simpan PDF ke buffer dan file
     pdf_buffer = io.BytesIO()
     html.write_pdf(pdf_buffer, stylesheets=[css])
-    result.zip_report_bytes = pdf_buffer.getvalue() # Store PDF bytes directly
+    result.pdf_report_bytes = pdf_buffer.getvalue()
 
-    # 7. Simpan ke file (opsional, untuk debugging atau akses langsung)
     report_path = Path(out_dir) / "laporan_forensik.pdf"
     with open(report_path, "wb") as f:
-        f.write(result.zip_report_bytes)
-    result.pdf_report_path = str(report_path) # Update result with PDF path
+        f.write(result.pdf_report_bytes)
+    result.pdf_report_path = str(report_path)
 
     # Generate DOCX report if available
     if DOCX_AVAILABLE:
@@ -3450,7 +3451,16 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
             log(f"  {Icons.ERROR} Gagal membuat laporan DOCX: {e}")
             result.docx_report_path = None
 
-        return result
+    # 8. Buat arsip ZIP yang berisi seluruh laporan dan artefak
+    zip_path = create_zip_archive(result, out_dir)
+    if zip_path:
+        result.zip_report_path = zip_path
+        result.zip_report_bytes = zip_path.read_bytes()
+    else:
+        result.zip_report_path = None
+        result.zip_report_bytes = None
+
+    return result
 
 ###############################################################################
 # MAIN EXECUTION
