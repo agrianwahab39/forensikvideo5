@@ -192,6 +192,8 @@ class AnalysisResult:
     video_path: str
     preservation_hash: str
     metadata: dict
+    metadata_raw: dict = field(default_factory=dict)
+    metadata_analysis: dict = field(default_factory=dict)
     frames: list[FrameInfo]
     summary: dict = field(default_factory=dict)
     plots: dict = field(default_factory=dict)
@@ -520,6 +522,8 @@ def parse_ffprobe_output(metadata: dict) -> dict:
             'Size': f"{int(fmt.get('size', 0)) / (1024*1024):.2f} MB",
             'Bit Rate': f"{int(fmt.get('bit_rate', 0)) / 1000:.0f} kb/s",
             'Creation Time': fmt.get('tags', {}).get('creation_time', 'N/A'),
+            'Encoder': fmt.get('tags', {}).get('encoder', 'N/A'),
+            'Software': fmt.get('tags', {}).get('software', 'N/A'),
         }
 
     video_streams = [s for s in metadata.get('streams', []) if s.get('codec_type') == 'video']
@@ -537,6 +541,37 @@ def parse_ffprobe_output(metadata: dict) -> dict:
         }
 
     return parsed
+
+# --- FUNGSI BARU: ANALISIS METADATA UNTUK STATUS EDITING ---
+def analyze_video_metadata(metadata: dict) -> dict:
+    """Menganalisis metadata terurai untuk mengidentifikasi kemungkinan jejak editing."""
+    analysis = {
+        'edited': False,
+        'editing_software': 'Unknown',
+        'creation_time': None,
+    }
+
+    fmt = metadata.get('Format', {})
+    video_stream = metadata.get('Video Stream', {})
+    creation_time = fmt.get('Creation Time')
+    if creation_time:
+        analysis['creation_time'] = creation_time
+
+    # Cek keberadaan software/encoder yang biasa muncul akibat proses editing
+    software_fields = [
+        fmt.get('Encoder'),
+        fmt.get('Software'),
+        video_stream.get('Encoder'),
+    ]
+    for field in software_fields:
+        if field and field != 'N/A':
+            analysis['editing_software'] = field
+            break
+
+    if analysis['editing_software'] != 'Unknown':
+        analysis['edited'] = True
+
+    return analysis
 
 # --- FUNGSI DIREVISI: EKSTRAKSI FRAME DENGAN NORMALISASI WARNA ---
 def extract_frames_with_normalization(video_path: Path, out_dir: Path, fps: int) -> list[tuple[str, str, str]] | None:
@@ -2144,6 +2179,8 @@ def run_tahap_1_pra_pemrosesan(video_path: Path, out_dir: Path, fps: int) -> Ana
         video_path=str(video_path),
         preservation_hash=preservation_hash,
         metadata=metadata,
+        metadata_raw=metadata_raw,
+        metadata_analysis=analyze_video_metadata(metadata),
         frames=frames,
         kmeans_artifacts=kmeans_artifacts
     )
@@ -3102,7 +3139,8 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
         'plots': {},          # akan diisi dengan bytes
         'include_simple': include_simple,
         'include_technical': include_technical,
-        'metadata': result.metadata
+        'metadata': result.metadata,
+        'metadata_analysis': result.metadata_analysis
     }
 
     # Konversi gambar lokal dan plot menjadi bytes untuk penyematan
@@ -3289,6 +3327,21 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
                 {% endfor %}
             {% else %}
                 <p>Tidak ada metadata yang tersedia.</p>
+            {% endif %}
+        </div>
+
+        <div class="section">
+            <h2>Analisis Metadata</h2>
+            {% if metadata_analysis %}
+                <table>
+                    <tr><td>Status Editing</td><td>{{ 'Ya' if metadata_analysis.edited else 'Tidak' }}</td></tr>
+                    <tr><td>Perangkat Lunak</td><td>{{ metadata_analysis.editing_software }}</td></tr>
+                    {% if metadata_analysis.creation_time %}
+                        <tr><td>Waktu Pembuatan</td><td>{{ metadata_analysis.creation_time }}</td></tr>
+                    {% endif %}
+                </table>
+            {% else %}
+                <p>Tidak ada analisis metadata.</p>
             {% endif %}
         </div>
 
@@ -3493,6 +3546,20 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
                         row_cells[1].text = str(value)
             else:
                 document.add_paragraph('Tidak ada metadata yang tersedia.')
+
+            document.add_heading('Analisis Metadata', level=1)
+            if report_data['metadata_analysis']:
+                table = document.add_table(rows=1, cols=2)
+                table.rows[0].cells[0].text = 'Kriteria'
+                table.rows[0].cells[1].text = 'Nilai'
+                table.add_row().cells[0].text = 'Status Editing'; table.rows[1].cells[1].text = 'Ya' if report_data['metadata_analysis']['edited'] else 'Tidak'
+                table.add_row().cells[0].text = 'Perangkat Lunak'; table.rows[2].cells[1].text = report_data['metadata_analysis']['editing_software']
+                if report_data['metadata_analysis'].get('creation_time'):
+                    row = table.add_row().cells
+                    row[0].text = 'Waktu Pembuatan'
+                    row[1].text = str(report_data['metadata_analysis']['creation_time'])
+            else:
+                document.add_paragraph('Tidak ada analisis metadata.')
 
             document.save(docx_path)
             log(f"  ✅ Laporan DOCX berhasil dibuat: {docx_path.name}")
