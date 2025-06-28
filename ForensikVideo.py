@@ -188,22 +188,10 @@ class FrameInfo:
     blur_metric: float | None = None
 
 @dataclass
-class AnalysisResult:
-    video_path: str
-    preservation_hash: str
-    metadata: dict
-    metadata_raw: dict = field(default_factory=dict)
-    metadata_analysis: dict = field(default_factory=dict)
-    frames: list[FrameInfo]
     summary: dict = field(default_factory=dict)
     plots: dict = field(default_factory=dict)
     # --- PENAMBAHAN: Artefak K-Means yang Detail ---
     kmeans_artifacts: dict = field(default_factory=dict)
-    localizations: list[dict] = field(default_factory=list)
-    zip_report_path: Optional[Path] = None
-    pdf_report_path: Optional[Path] = None
-    zip_report_bytes: Optional[bytes] = None
-    pdf_report_bytes: Optional[bytes] = None
 
     # Tambahan untuk Tahap 3
     detailed_anomaly_analysis: dict = field(default_factory=dict)
@@ -515,16 +503,6 @@ def parse_ffprobe_output(metadata: dict) -> dict:
     parsed = {}
     if 'format' in metadata:
         fmt = metadata['format']
-        parsed['Format'] = {
-            'Filename': Path(fmt.get('filename', 'N/A')).name,
-            'Format Name': fmt.get('format_long_name', 'N/A'),
-            'Duration': f"{float(fmt.get('duration', 0)):.3f} s",
-            'Size': f"{int(fmt.get('size', 0)) / (1024*1024):.2f} MB",
-            'Bit Rate': f"{int(fmt.get('bit_rate', 0)) / 1000:.0f} kb/s",
-            'Creation Time': fmt.get('tags', {}).get('creation_time', 'N/A'),
-            'Encoder': fmt.get('tags', {}).get('encoder', 'N/A'),
-            'Software': fmt.get('tags', {}).get('software', 'N/A'),
-        }
 
     video_streams = [s for s in metadata.get('streams', []) if s.get('codec_type') == 'video']
     if video_streams:
@@ -541,6 +519,37 @@ def parse_ffprobe_output(metadata: dict) -> dict:
         }
 
     return parsed
+
+# --- FUNGSI BARU: ANALISIS METADATA UNTUK STATUS EDITING ---
+def analyze_video_metadata(metadata: dict) -> dict:
+    """Menganalisis metadata terurai untuk mengidentifikasi kemungkinan jejak editing."""
+    analysis = {
+        'edited': False,
+        'editing_software': 'Unknown',
+        'creation_time': None,
+    }
+
+    fmt = metadata.get('Format', {})
+    video_stream = metadata.get('Video Stream', {})
+    creation_time = fmt.get('Creation Time')
+    if creation_time:
+        analysis['creation_time'] = creation_time
+
+    # Cek keberadaan software/encoder yang biasa muncul akibat proses editing
+    software_fields = [
+        fmt.get('Encoder'),
+        fmt.get('Software'),
+        video_stream.get('Encoder'),
+    ]
+    for field in software_fields:
+        if field and field != 'N/A':
+            analysis['editing_software'] = field
+            break
+
+    if analysis['editing_software'] != 'Unknown':
+        analysis['edited'] = True
+
+    return analysis
 
 # --- FUNGSI BARU: ANALISIS METADATA UNTUK STATUS EDITING ---
 def analyze_video_metadata(metadata: dict) -> dict:
@@ -2019,35 +2028,6 @@ def create_findings_summary(result: AnalysisResult, ferm: dict, out_dir: Path) -
     
     return out_path
 
-def create_zip_archive(result: AnalysisResult, out_dir: Path) -> Path | None:
-    """Membuat arsip ZIP yang berisi seluruh laporan dan artefak analisis."""
-
-    zip_filename = f"Laporan_Lengkap_{Path(result.video_path).stem}.zip"
-    zip_path = out_dir / zip_filename
-
-    log(f"  {Icons.INFO} Membuat arsip ZIP lengkap...")
-
-    try:
-        # Kumpulkan semua file terlebih dahulu agar file ZIP tidak ikut terarsip
-        files_to_zip: list[tuple[Path, Path]] = []
-        for root, dirs, files in os.walk(out_dir):
-            for file in files:
-                file_path = Path(root) / file
-                if file_path.resolve() != zip_path.resolve():
-                    arcname = file_path.relative_to(out_dir)
-                    files_to_zip.append((file_path, arcname))
-
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for file_path, arcname in files_to_zip:
-                zipf.write(file_path, arcname=arcname)
-
-        log(f"  ✅ Arsip ZIP berhasil dibuat: {zip_path.name}")
-        return zip_path
-    except Exception as e:
-        log(f"  {Icons.ERROR} Gagal membuat arsip ZIP: {e}")
-        return None
-
-
 ###############################################################################
 # PIPELINE 5-TAHAP
 ###############################################################################
@@ -2175,15 +2155,6 @@ def run_tahap_1_pra_pemrosesan(video_path: Path, out_dir: Path, fps: int) -> Ana
                 })
             log(f"  -> Artefak K-Means berhasil dibuat di direktori {kmeans_dir.name}")
 
-    result = AnalysisResult(
-        video_path=str(video_path),
-        preservation_hash=preservation_hash,
-        metadata=metadata,
-        metadata_raw=metadata_raw,
-        metadata_analysis=analyze_video_metadata(metadata),
-        frames=frames,
-        kmeans_artifacts=kmeans_artifacts
-    )
 
     log(f"  {Icons.SUCCESS} Tahap 1 Selesai.")
     return result
@@ -3123,24 +3094,6 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
         )
 
     # 2. Persiapkan konten laporan
-    report_data = {
-        'judul': 'Laporan Analisis Forensik Video',
-        'tanggal': datetime.now().strftime("%d %B %Y"),
-        'preservation_hash': result.preservation_hash,
-        'video_name': Path(result.video_path).name,
-        'total_frames': result.summary.get('total_frames', 'N/A'),
-        'total_anomalies': result.summary.get('total_anomaly', 'N/A'),
-        'pct_anomaly': result.summary.get('pct_anomaly', 'N/A'),
-        'total_events': result.localization_details.get('total_events', 'N/A'),
-        'reliability_assessment': result.forensic_evidence_matrix['conclusion']['reliability_assessment'],
-        'primary_findings': result.forensic_evidence_matrix['conclusion']['primary_findings'],
-        'recommended_actions': result.forensic_evidence_matrix['conclusion']['recommended_actions'],
-        'localizations': [],  # akan diisi dengan bytes
-        'plots': {},          # akan diisi dengan bytes
-        'include_simple': include_simple,
-        'include_technical': include_technical,
-
-    }
 
     # Konversi gambar lokal dan plot menjadi bytes untuk penyematan
     locs_for_report: list[dict] = []
@@ -3344,6 +3297,21 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
             {% endif %}
         </div>
 
+        <div class="section">
+            <h2>Analisis Metadata</h2>
+            {% if metadata_analysis %}
+                <table>
+                    <tr><td>Status Editing</td><td>{{ 'Ya' if metadata_analysis.edited else 'Tidak' }}</td></tr>
+                    <tr><td>Perangkat Lunak</td><td>{{ metadata_analysis.editing_software }}</td></tr>
+                    {% if metadata_analysis.creation_time %}
+                        <tr><td>Waktu Pembuatan</td><td>{{ metadata_analysis.creation_time }}</td></tr>
+                    {% endif %}
+                </table>
+            {% else %}
+                <p>Tidak ada analisis metadata.</p>
+            {% endif %}
+        </div>
+
         <div class="footer">
             <p>Laporan ini dihasilkan secara otomatis oleh VIFA-Pro.</p>
         </div>
@@ -3353,20 +3321,7 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
 
     # 4. Render template dengan data
     env = Environment(loader=BaseLoader())
-    # Add base64 filter yang dapat menerima bytes atau path file
-    import base64
-    def b64encode_data(data):
-        try:
-            if isinstance(data, bytes):
-                raw = data
-            else:
-                path_obj = Path(str(data))
-                raw = path_obj.read_bytes()
-            return base64.b64encode(raw).decode('utf-8')
-        except Exception:
-            return ''
 
-    env.filters['b64encode'] = b64encode_data
     template = env.from_string(template_str)
     html_content = template.render(**report_data)
 
@@ -3388,16 +3343,6 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
             }}
         }}
     ''')
-
-    # 6. Simpan PDF ke buffer dan file
-    pdf_buffer = io.BytesIO()
-    html.write_pdf(pdf_buffer, stylesheets=[css])
-    result.pdf_report_bytes = pdf_buffer.getvalue()
-
-    report_path = Path(out_dir) / "laporan_forensik.pdf"
-    with open(report_path, "wb") as f:
-        f.write(result.pdf_report_bytes)
-    result.pdf_report_path = str(report_path)
 
     # Generate DOCX report if available
     if DOCX_AVAILABLE:
@@ -3487,29 +3432,6 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
                                         row_cells[0].text = m_key.replace('_', ' ').capitalize()
                                         row_cells[1].text = f"{m_val:.3f}" if isinstance(m_val, (int, float)) else str(m_val)
 
-                    if loc.get('image_bytes'):
-                        document.add_paragraph('Frame Bukti Visual:')
-                        image_stream = io.BytesIO(loc['image_bytes'])
-                        document.add_picture(image_stream, width=Inches(5))
-                    elif loc.get('image') and Path(loc['image']).exists():
-                        document.add_paragraph('Frame Bukti Visual:')
-                        document.add_picture(loc['image'], width=Inches(5))
-
-                    if loc.get('ela_path_bytes'):
-                        document.add_paragraph('Analisis ELA:')
-                        image_stream = io.BytesIO(loc['ela_path_bytes'])
-                        document.add_picture(image_stream, width=Inches(5))
-                    elif loc.get('ela_path') and Path(loc['ela_path']).exists():
-                        document.add_paragraph('Analisis ELA:')
-                        document.add_picture(loc['ela_path'], width=Inches(5))
-
-                    if loc.get('sift_path_bytes'):
-                        document.add_paragraph('Analisis SIFT:')
-                        image_stream = io.BytesIO(loc['sift_path_bytes'])
-                        document.add_picture(image_stream, width=Inches(5))
-                    elif loc.get('sift_path') and Path(loc['sift_path']).exists():
-                        document.add_paragraph('Analisis SIFT:')
-                        document.add_picture(loc['sift_path'], width=Inches(5))
                     document.add_paragraph() # Add a blank line for spacing
             else:
                 document.add_paragraph('Tidak ada peristiwa anomali signifikan yang terdeteksi.')
@@ -3517,18 +3439,6 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
 
             # Visualizations
             document.add_heading('Visualisasi Hasil Analisis', level=1)
-            if report_data['plots']:
-                for key, path_bytes in report_data['plots'].items():
-                    if key.endswith('_bytes'):
-                        document.add_heading(key.replace('_bytes', '').replace('_', ' ').capitalize(), level=2)
-                        image_stream = io.BytesIO(path_bytes)
-                        document.add_picture(image_stream, width=Inches(6))
-                    else:
-                        if Path(path_bytes).exists():
-                            document.add_heading(key.replace('_', ' ').capitalize(), level=2)
-                            document.add_picture(path_bytes, width=Inches(6))
-            else:
-                document.add_paragraph('Tidak ada visualisasi yang dihasilkan.')
             document.add_page_break()
 
             # Metadata
@@ -3560,23 +3470,22 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
             else:
                 document.add_paragraph('Tidak ada analisis metadata.')
 
+            document.add_heading('Analisis Metadata', level=1)
+            if report_data['metadata_analysis']:
+                table = document.add_table(rows=1, cols=2)
+                table.rows[0].cells[0].text = 'Kriteria'
+                table.rows[0].cells[1].text = 'Nilai'
+                table.add_row().cells[0].text = 'Status Editing'; table.rows[1].cells[1].text = 'Ya' if report_data['metadata_analysis']['edited'] else 'Tidak'
+                table.add_row().cells[0].text = 'Perangkat Lunak'; table.rows[2].cells[1].text = report_data['metadata_analysis']['editing_software']
+                if report_data['metadata_analysis'].get('creation_time'):
+                    row = table.add_row().cells
+                    row[0].text = 'Waktu Pembuatan'
+                    row[1].text = str(report_data['metadata_analysis']['creation_time'])
+            else:
+                document.add_paragraph('Tidak ada analisis metadata.')
+
             document.save(docx_path)
             log(f"  ✅ Laporan DOCX berhasil dibuat: {docx_path.name}")
-            result.docx_report_path = str(docx_path)
-        except Exception as e:
-            log(f"  {Icons.ERROR} Gagal membuat laporan DOCX: {e}")
-            result.docx_report_path = None
-
-    # 8. Buat arsip ZIP yang berisi seluruh laporan dan artefak
-    zip_path = create_zip_archive(result, out_dir)
-    if zip_path:
-        result.zip_report_path = zip_path
-        result.zip_report_bytes = zip_path.read_bytes()
-    else:
-        result.zip_report_path = None
-        result.zip_report_bytes = None
-
-    return result
 
 ###############################################################################
 # MAIN EXECUTION
