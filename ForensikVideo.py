@@ -200,6 +200,8 @@ class AnalysisResult:
     localizations: list[dict] = field(default_factory=list)
     zip_report_path: Optional[Path] = None
     pdf_report_path: Optional[Path] = None
+    zip_report_bytes: Optional[bytes] = None
+    pdf_report_bytes: Optional[bytes] = None
 
     # Tambahan untuk Tahap 3
     detailed_anomaly_analysis: dict = field(default_factory=dict)
@@ -1983,26 +1985,27 @@ def create_findings_summary(result: AnalysisResult, ferm: dict, out_dir: Path) -
     return out_path
 
 def create_zip_archive(result: AnalysisResult, out_dir: Path) -> Path | None:
-    """
-    Membuat arsip ZIP yang berisi semua laporan dan artefak analisis.
-    """
+    """Membuat arsip ZIP yang berisi seluruh laporan dan artefak analisis."""
+
     zip_filename = f"Laporan_Lengkap_{Path(result.video_path).stem}.zip"
     zip_path = out_dir / zip_filename
-    
+
     log(f"  {Icons.INFO} Membuat arsip ZIP lengkap...")
-    
+
     try:
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Meng-zip seluruh direktori output, kecuali file zip itu sendiri.
-            for root, dirs, files in os.walk(out_dir):
-                for file in files:
-                    file_path = Path(root) / file
-                    # Hindari menambahkan file ZIP itu sendiri ke dalam arsip
-                    if file_path.resolve() != zip_path.resolve():
-                        # Buat path relatif untuk disimpan di dalam ZIP
-                        arcname = file_path.relative_to(out_dir)
-                        zipf.write(file_path, arcname=arcname)
-                        
+        # Kumpulkan semua file terlebih dahulu agar file ZIP tidak ikut terarsip
+        files_to_zip: list[tuple[Path, Path]] = []
+        for root, dirs, files in os.walk(out_dir):
+            for file in files:
+                file_path = Path(root) / file
+                if file_path.resolve() != zip_path.resolve():
+                    arcname = file_path.relative_to(out_dir)
+                    files_to_zip.append((file_path, arcname))
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for file_path, arcname in files_to_zip:
+                zipf.write(file_path, arcname=arcname)
+
         log(f"  ✅ Arsip ZIP berhasil dibuat: {zip_path.name}")
         return zip_path
     except Exception as e:
@@ -3095,12 +3098,35 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
         'reliability_assessment': result.forensic_evidence_matrix['conclusion']['reliability_assessment'],
         'primary_findings': result.forensic_evidence_matrix['conclusion']['primary_findings'],
         'recommended_actions': result.forensic_evidence_matrix['conclusion']['recommended_actions'],
-        'localizations': result.localizations,
-        'plots': result.plots,
+        'localizations': [],  # akan diisi dengan bytes
+        'plots': {},          # akan diisi dengan bytes
         'include_simple': include_simple,
         'include_technical': include_technical,
         'metadata': result.metadata
     }
+
+    # Konversi gambar lokal dan plot menjadi bytes untuk penyematan
+    locs_for_report: list[dict] = []
+    for loc in result.localizations:
+        loc_copy = loc.copy()
+        for fkey in ("image", "ela_path", "sift_path"):
+            fpath = loc_copy.get(fkey)
+            try:
+                if fpath and Path(fpath).exists():
+                    loc_copy[f"{fkey}_bytes"] = Path(fpath).read_bytes()
+            except Exception as e:
+                log(f"  {Icons.ERROR} Gagal membaca {fkey} {fpath}: {e}")
+        locs_for_report.append(loc_copy)
+    report_data['localizations'] = locs_for_report
+
+    plot_bytes = {}
+    for key, pth in result.plots.items():
+        try:
+            if pth and Path(pth).exists():
+                plot_bytes[f"{key}_bytes"] = Path(pth).read_bytes()
+        except Exception as e:
+            log(f"  {Icons.ERROR} Gagal membaca plot {key}: {e}")
+    report_data['plots'] = plot_bytes
 
     # 3. Template HTML dengan CSS styling
     template_str = """
@@ -3275,9 +3301,20 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
 
     # 4. Render template dengan data
     env = Environment(loader=BaseLoader())
-    # Add base64 filter
+    # Add base64 filter yang dapat menerima bytes atau path file
     import base64
-    env.filters['b64encode'] = lambda s: base64.b64encode(s.encode('utf-8')).decode('utf-8')
+    def b64encode_data(data):
+        try:
+            if isinstance(data, bytes):
+                raw = data
+            else:
+                path_obj = Path(str(data))
+                raw = path_obj.read_bytes()
+            return base64.b64encode(raw).decode('utf-8')
+        except Exception:
+            return ''
+
+    env.filters['b64encode'] = b64encode_data
     template = env.from_string(template_str)
     html_content = template.render(**report_data)
 
@@ -3300,16 +3337,15 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
         }}
     ''')
 
-    # 6. Simpan hasil ke buffer
+    # 6. Simpan PDF ke buffer dan file
     pdf_buffer = io.BytesIO()
     html.write_pdf(pdf_buffer, stylesheets=[css])
-    result.zip_report_bytes = pdf_buffer.getvalue() # Store PDF bytes directly
+    result.pdf_report_bytes = pdf_buffer.getvalue()
 
-    # 7. Simpan ke file (opsional, untuk debugging atau akses langsung)
     report_path = Path(out_dir) / "laporan_forensik.pdf"
     with open(report_path, "wb") as f:
-        f.write(result.zip_report_bytes)
-    result.pdf_report_path = str(report_path) # Update result with PDF path
+        f.write(result.pdf_report_bytes)
+    result.pdf_report_path = str(report_path)
 
     # Generate DOCX report if available
     if DOCX_AVAILABLE:
@@ -3403,14 +3439,25 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
                         document.add_paragraph('Frame Bukti Visual:')
                         image_stream = io.BytesIO(loc['image_bytes'])
                         document.add_picture(image_stream, width=Inches(5))
+                    elif loc.get('image') and Path(loc['image']).exists():
+                        document.add_paragraph('Frame Bukti Visual:')
+                        document.add_picture(loc['image'], width=Inches(5))
+
                     if loc.get('ela_path_bytes'):
                         document.add_paragraph('Analisis ELA:')
                         image_stream = io.BytesIO(loc['ela_path_bytes'])
                         document.add_picture(image_stream, width=Inches(5))
+                    elif loc.get('ela_path') and Path(loc['ela_path']).exists():
+                        document.add_paragraph('Analisis ELA:')
+                        document.add_picture(loc['ela_path'], width=Inches(5))
+
                     if loc.get('sift_path_bytes'):
                         document.add_paragraph('Analisis SIFT:')
                         image_stream = io.BytesIO(loc['sift_path_bytes'])
                         document.add_picture(image_stream, width=Inches(5))
+                    elif loc.get('sift_path') and Path(loc['sift_path']).exists():
+                        document.add_paragraph('Analisis SIFT:')
+                        document.add_picture(loc['sift_path'], width=Inches(5))
                     document.add_paragraph() # Add a blank line for spacing
             else:
                 document.add_paragraph('Tidak ada peristiwa anomali signifikan yang terdeteksi.')
@@ -3424,6 +3471,10 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
                         document.add_heading(key.replace('_bytes', '').replace('_', ' ').capitalize(), level=2)
                         image_stream = io.BytesIO(path_bytes)
                         document.add_picture(image_stream, width=Inches(6))
+                    else:
+                        if Path(path_bytes).exists():
+                            document.add_heading(key.replace('_', ' ').capitalize(), level=2)
+                            document.add_picture(path_bytes, width=Inches(6))
             else:
                 document.add_paragraph('Tidak ada visualisasi yang dihasilkan.')
             document.add_page_break()
@@ -3450,7 +3501,16 @@ def run_tahap_5_pelaporan_dan_validasi(result, out_dir, baseline_result, include
             log(f"  {Icons.ERROR} Gagal membuat laporan DOCX: {e}")
             result.docx_report_path = None
 
-        return result
+    # 8. Buat arsip ZIP yang berisi seluruh laporan dan artefak
+    zip_path = create_zip_archive(result, out_dir)
+    if zip_path:
+        result.zip_report_path = zip_path
+        result.zip_report_bytes = zip_path.read_bytes()
+    else:
+        result.zip_report_path = None
+        result.zip_report_bytes = None
+
+    return result
 
 ###############################################################################
 # MAIN EXECUTION
